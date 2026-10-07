@@ -1,0 +1,7 @@
+pandas
+pandas-ta
+numpy
+yfinance
+py_vollib
+jugaad-data
+git+https://github.com/rongardF/tvdatafeed.git
