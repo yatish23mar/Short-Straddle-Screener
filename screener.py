@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 # =====================================================================
 # CONFIGURATION
 # =====================================================================
-TARGET_DATE = date.today()        # Automatically uses the GitHub execution date
+TARGET_DATE = date.today()        # Automatically uses the execution date
 EXPIRY_DATE = date(2026, 10, 29)  # UPDATE THIS MONTHLY to the next F&O Expiry
 RISK_FREE_RATE = 0.07             
 BHAVCOPY_DIR = "/tmp"             
@@ -28,25 +28,77 @@ BHAVCOPY_DIR = "/tmp"
 tv = TvDatafeed()
 
 # =====================================================================
+# MASTER F&O FALLBACK UNIVERSE (213 CONSTITUENTS)
+# =====================================================================
+FALLBACK_FO_UNIVERSE = [
+    "ADANIENT", "LODHA", "LT", "MANAPPURAM", "ONGC", "POLYCAB", "RADICO", "WIPRO", 
+    "SRF", "ATHERENERG", "BOSCHLTD", "MFSL", "PRESTIGE", "TATAPOWER", "TIINDIA", 
+    "HAL", "INDUSTOWER", "MARUTI", "PIDILITIND", "RECLTD", "SHREECEM", "BANDHANBNK", 
+    "CIPLA", "FORTIS", "GVT&D", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "IEX", "INFY", 
+    "KPITTECH", "LUPIN", "SAGILITY", "SAIL", "SBILIFE", "SIEMENS", "360ONE", 
+    "ABCAPITAL", "ADANIPORTS", "AMBER", "ASHOKLEY", "AUBANK", "BAJFINANCE", 
+    "BANKINDIA", "BHARTIARTL", "BHEL", "BLUESTARCO", "BRITANNIA", "BSE", "CAMS", 
+    "COFORGE", "COLPAL", "CROMPTON", "FEDERALBNK", "HDFCAMC", "HINDZINC", "ICICIGI", 
+    "ICICIPRULI", "IDEA", "INDIANB", "JUBLFOOD", "KALYANKJIL", "KEI", "MARICO", 
+    "MOTILALOFS", "MPHASIS", "NTPC", "NYKAA", "OFSS", "PATANJALI", "RBLBANK", 
+    "SHRIRAMFIN", "TCS", "TMPV", "UNITDSPR", "VBL", "VEDL", "VOLTAS", "YESBANK", 
+    "ADANIENSOL", "ADANIPOWER", "ANANDRATHI", "ANGELONE", "ASTRAL", "AUROPHARMA", 
+    "BAJAJFINSV", "BAJAJHLDNG", "BANKBARODA", "CHOLAFIN", "DLF", "EICHERMOT", 
+    "ETERNAL", "GODFRYPHLP", "HINDUNILVR", "ICICIBANK", "IDFCFIRSTB", "INDHOTEL", 
+    "IREDA", "ITC", "KAYNES", "KFINTECH", "M&M", "MAHABANK", "NAM-INDIA", 
+    "NATIONALUM", "PAGEIND", "PAYTM", "PERSISTENT", "PFC", "PGEL", "PNB", 
+    "PNBHOUSING", "POWERGRID", "PREMIERENE", "RELIANCE", "SOLARINDS", "SUPREMEIND", 
+    "TATAELXSI", "TVSMOTOR", "UJJIVANSFB", "ULTRACEMCO", "APLAPOLLO", "APOLLOHOSP", 
+    "ASIANPAINT", "BAJAJ-AUTO", "BHARATFORG", "BPCL", "DIVISLAB", "DMART", "DRREDDY", 
+    "ENRIN", "FORCEMOT", "GAIL", "GLENMARK", "HCLTECH", "HINDPETRO", "HYUNDAI", 
+    "INDUSINDBK", "INOXWIND", "KOTAKBANK", "LAURUSLABS", "LICI", "LTF", "MANKIND", 
+    "MAXHEALTH", "MCX", "MOTHERSON", "NBCC", "NESTLEIND", "NHPC", "PIIND", 
+    "POLICYBZR", "SUNPHARMA", "TATACONSUM", "UNOMINDA", "UPL", "VMM", "ABB", 
+    "ADANIGREEN", "ALKEM", "AMBUJACEM", "AXISBANK", "BDL", "BEL", "BIOCON", 
+    "CANBK", "CDSL", "CGPOWER", "COALINDIA", "COCHINSHIP", "CONCOR", "CUMMINSIND", 
+    "DABUR", "DELHIVERY", "DIXON", "GMRAIRPORT", "GODREJCP", "GODREJPROP", "GRASIM", 
+    "HAVELLS", "HINDALCO", "INDIGO", "IOC", "IRFC", "JINDALSTEL", "JIOFIN", 
+    "JSWENERGY", "JSWSTEEL", "LICHSGFIN", "LTM", "MAZDOCK", "MUTHOOTFIN", "NAUKRI", 
+    "NMDC", "OBEROIRLTY", "OIL", "PETRONET", "PHOENIXLTD", "POWERINDIA", "RVNL", 
+    "SBICARD", "SBIN", "SONACOMS", "SUZLON", "SWIGGY", "TATASTEEL", "TECHM", 
+    "TITAN", "TORNTPHARM", "TRENT", "UNIONBANK", "WAAREEEENER", "ZYDUSLIFE"
+]
+
+# =====================================================================
 # CORE FUNCTIONS
 # =====================================================================
 def get_live_fo_watchlist() -> list[str]:
-    """Downloads the official F&O Market Lots CSV directly from NSE."""
+    """Downloads active symbols from NSE, handling header shifts and network blocks."""
     url = "https://archives.nseindia.com/content/fo/fo_mktlots.csv"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        df = pd.read_csv(io.StringIO(response.text), skipinitialspace=True)
-        df = df.dropna(subset=['SYMBOL'])
-        
-        symbols = df['SYMBOL'].astype(str).str.strip().unique().tolist()
-        indices = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
-        
-        return [sym for sym in symbols if sym not in indices and sym.upper() != 'SYMBOL']
+        response.raise_for_status()
+
+        raw_lines = [line.strip() for line in response.text.splitlines() if line.strip()]
+        header_idx = None
+        for idx, line in enumerate(raw_lines):
+            if "SYMBOL" in line.upper():
+                header_idx = idx
+                break
+
+        if header_idx is not None:
+            clean_csv_text = "\n".join(raw_lines[header_idx:])
+            df = pd.read_csv(io.StringIO(clean_csv_text), skipinitialspace=True, on_bad_lines='skip')
+            df = df.dropna(subset=['SYMBOL'])
+            symbols = df['SYMBOL'].astype(str).str.strip().unique().tolist()
+            indices = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
+            live_list = [sym for sym in symbols if sym not in indices and sym.upper() != 'SYMBOL']
+            
+            if live_list:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Loaded {len(live_list)} stocks from live NSE feed.")
+                return live_list
+
     except Exception as e:
-        print(f"Failed to fetch live F&O list: {e}")
-        return []
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Live parse issue ({e}). Using embedded fallback universe.")
+
+    return FALLBACK_FO_UNIVERSE
 
 def get_historical_volatility(close_prices: pd.Series, window: int = 20) -> pd.Series:
     log_returns = np.log(close_prices / close_prices.shift(1))
@@ -99,7 +151,7 @@ def run_short_straddle_screener(tickers: list[str]) -> pd.DataFrame:
     t_years = (EXPIRY_DATE - TARGET_DATE).days / 365.0
     results = []
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Scanning {len(tickers)} stocks...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Scanning universe of {len(tickers)} stocks...")
 
     for ticker in tickers:
         try:
@@ -158,7 +210,7 @@ def run_short_straddle_screener(tickers: list[str]) -> pd.DataFrame:
                     "Total Prem": round(ce_close + pe_close, 2), "IV Edge %": round(iv_edge, 2),
                 })
                 
-            time.sleep(0.5) # Prevent TradingView API disconnects
+            time.sleep(0.5)
             
         except Exception:
             time.sleep(0.5)
@@ -195,22 +247,16 @@ def send_email_alert(df_results):
 if __name__ == "__main__":
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Booting Screener...")
     
-    # 1. Dynamically load the full 180+ F&O market
-    full_market_watchlist = get_live_fo_watchlist()
+    watchlist = get_live_fo_watchlist()
+    print(f"Targeting universe of {len(watchlist)} stocks...")
     
-    if not full_market_watchlist:
-        print("Fatal Error: Could not fetch watchlist. Exiting.")
+    results = run_short_straddle_screener(watchlist)
+    
+    if not results.empty:
+        print("\n=== SHORT STRADDLE CANDIDATES ===")
+        print(results.to_string(index=False))
     else:
-        # 2. Run the screener
-        results = run_short_straddle_screener(full_market_watchlist)
+        print("\nNo setups passed the filters today.")
         
-        # 3. Print locally (visible in GitHub Actions logs)
-        if not results.empty:
-            print("\n=== SHORT STRADDLE CANDIDATES ===")
-            print(results.to_string(index=False))
-        else:
-            print("\nNo setups passed the filters today.")
-            
-        # 4. Email the results
-        send_email_alert(results)
-        print("Workflow complete.")
+    send_email_alert(results)
+    print("Workflow complete. Email sent.")
