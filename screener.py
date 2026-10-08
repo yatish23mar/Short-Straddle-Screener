@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pandas_ta as ta
 from tvDatafeed import TvDatafeed, Interval
-from jugaad_data.nse import bhavcopy_save
+from jugaad_data.nse import bhavcopy_fo_save
 from py_vollib.black_scholes.implied_volatility import implied_volatility
 import yfinance as yf
 
@@ -142,11 +142,31 @@ def calculate_iv_safe(price, spot, strike, t_years, r, flag):
 # MAIN SCREENER ENGINE
 # =====================================================================
 def run_short_straddle_screener(tickers: list[str]) -> pd.DataFrame:
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Downloading Bhavcopy...")
-    file_path = bhavcopy_save(TARGET_DATE, BHAVCOPY_DIR)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Downloading F&O Bhavcopy...")
+    
+    # 1. Download F&O Bhavcopy
+    file_path = bhavcopy_fo_save(TARGET_DATE, BHAVCOPY_DIR)
     bhavcopy = pd.read_csv(file_path)
-    bhavcopy = bhavcopy[bhavcopy["INSTRUMENT"] == "OPTSTK"].copy()
+    
+    # 2. Clean column headers and map UDiFF names to standard format
+    bhavcopy.columns = bhavcopy.columns.str.strip()
+    udiff_map = {
+        "FinInstrmTp": "INSTRUMENT",
+        "TckrSymb": "SYMBOL",
+        "XpryDt": "EXPIRY_DT",
+        "StrkPric": "STRIKE_PR",
+        "OptnTp": "OPTION_TYP",
+        "ClsPric": "CLOSE",
+        "OpnIntrst": "OPEN_INT"
+    }
+    bhavcopy.rename(columns=udiff_map, inplace=True)
+
+    # 3. Filter for Stock Options (supports legacy OPTSTK & UDiFF STO codes)
+    bhavcopy = bhavcopy[bhavcopy["INSTRUMENT"].isin(["OPTSTK", "STO"])].copy()
     bhavcopy["EXPIRY_DT"] = pd.to_datetime(bhavcopy["EXPIRY_DT"]).dt.date
+    bhavcopy["STRIKE_PR"] = pd.to_numeric(bhavcopy["STRIKE_PR"], errors='coerce')
+    bhavcopy["CLOSE"] = pd.to_numeric(bhavcopy["CLOSE"], errors='coerce')
+    bhavcopy["OPEN_INT"] = pd.to_numeric(bhavcopy["OPEN_INT"], errors='coerce').fillna(0)
 
     t_years = (EXPIRY_DATE - TARGET_DATE).days / 365.0
     results = []
