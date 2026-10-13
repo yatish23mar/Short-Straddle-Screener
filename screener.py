@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 # =====================================================================
 # CONFIGURATION
 # =====================================================================
-EXPIRY_DATE = date(2026, 10, 29)  # Update monthly to the next F&O Expiry
+EXPIRY_DATE = date(2026, 10, 29)  
 RISK_FREE_RATE = 0.07             
 BHAVCOPY_DIR = "/tmp"             
 
@@ -67,7 +67,6 @@ FALLBACK_FO_UNIVERSE = [
 # DATA EXTRACTION & RESILIENCE
 # =====================================================================
 def get_historical_data(ticker: str) -> pd.DataFrame:
-    """Attempts TvDatafeed first; automatically falls back to Yahoo Finance on timeout."""
     try:
         df = tv.get_hist(symbol=ticker, exchange="NSE", interval=Interval.in_daily, n_bars=250)
         if df is not None and not df.empty and len(df) >= 50:
@@ -76,7 +75,6 @@ def get_historical_data(ticker: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # Fallback to yfinance
     try:
         clean_sym = ticker.replace("&", "%26")
         stock = yf.Ticker(f"{clean_sym}.NS")
@@ -85,11 +83,9 @@ def get_historical_data(ticker: str) -> pd.DataFrame:
             return df[["Open", "High", "Low", "Close"]]
     except Exception:
         pass
-
     return pd.DataFrame()
 
 def download_latest_fo_bhavcopy() -> tuple[pd.DataFrame, date]:
-    """Tries today's date, stepping back up to 5 days for weekends/holidays."""
     check_date = date.today()
     for _ in range(5):
         try:
@@ -98,7 +94,6 @@ def download_latest_fo_bhavcopy() -> tuple[pd.DataFrame, date]:
             bhavcopy = pd.read_csv(file_path)
             bhavcopy.columns = bhavcopy.columns.str.strip()
             
-            # Map UDiFF or legacy column headers
             udiff_map = {
                 "FinInstrmTp": "INSTRUMENT", "TckrSymb": "SYMBOL", "XpryDt": "EXPIRY_DT",
                 "StrkPric": "STRIKE_PR", "OptnTp": "OPTION_TYP", "ClsPric": "CLOSE", "OpnIntrst": "OPEN_INT"
@@ -114,7 +109,6 @@ def download_latest_fo_bhavcopy() -> tuple[pd.DataFrame, date]:
             return bhavcopy, check_date
         except Exception:
             check_date -= timedelta(days=1)
-            
     raise RuntimeError("Could not retrieve a valid F&O Bhavcopy within the last 5 days.")
 
 def get_historical_volatility(close_prices: pd.Series, window: int = 20) -> pd.Series:
@@ -157,17 +151,18 @@ def calculate_iv_safe(price, spot, strike, t_years, r, flag):
         return np.nan
 
 # =====================================================================
-# SCREENER LOGIC
+# SCREENER LOGIC (FULL TABULATION)
 # =====================================================================
 def run_short_straddle_screener(tickers: list[str]) -> tuple[pd.DataFrame, date]:
     bhavcopy, target_date = download_latest_fo_bhavcopy()
     t_years = max((EXPIRY_DATE - target_date).days / 365.0, 0.001)
     results = []
 
-    print(f"Scanning {len(tickers)} stocks against settlements on {target_date}...")
+    print(f"Scanning and tabulating {len(tickers)} stocks...")
 
     for ticker in tickers:
         try:
+            # 1. Price Data & Technicals
             df = get_historical_data(ticker)
             if df.empty or len(df) < 50:
                 continue
@@ -177,15 +172,16 @@ def run_short_straddle_screener(tickers: list[str]) -> tuple[pd.DataFrame, date]
             df["ADX"] = adx_df[[col for col in adx_df.columns if col.startswith("ADX")][0]]
             df["RSI"] = ta.rsi(df["Close"], length=14)
             df["HV_20"] = get_historical_volatility(df["Close"], window=20)
-            latest = df.iloc[-1]
-
-            if not (latest["ADX"] < 20 and 40 <= latest["RSI"] <= 60):
-                continue
             
+            latest = df.iloc[-1]
+            adx_val = round(latest["ADX"], 1)
+            rsi_val = round(latest["RSI"], 1)
+            hv_val = latest["HV_20"]
+            
+            # 2. Earnings
             days_to_earnings = get_days_to_earnings(ticker)
-            if days_to_earnings <= 30:
-                continue
 
+            # 3. Options Data & Max Pain
             ticker_opts = bhavcopy[(bhavcopy["SYMBOL"] == ticker) & (bhavcopy["EXPIRY_DT"] == EXPIRY_DATE)].copy()
             if ticker_opts.empty:
                 continue
@@ -193,6 +189,7 @@ def run_short_straddle_screener(tickers: list[str]) -> tuple[pd.DataFrame, date]
             max_pain_strike = calculate_max_pain(ticker_opts)
             pain_distance_pct = (abs(latest_spot - max_pain_strike) / latest_spot) * 100
 
+            # 4. Calculate ATM Options
             ticker_opts["Strike_Diff"] = abs(ticker_opts["STRIKE_PR"] - latest_spot)
             atm_strike = ticker_opts.loc[ticker_opts["Strike_Diff"].idxmin()]["STRIKE_PR"]
 
@@ -203,52 +200,92 @@ def run_short_straddle_screener(tickers: list[str]) -> tuple[pd.DataFrame, date]
                 continue
 
             ce_close, pe_close = atm_ce.iloc[0]["CLOSE"], atm_pe.iloc[0]["CLOSE"]
+            straddle_prem = ce_close + pe_close
+            
             avg_iv = (calculate_iv_safe(ce_close, latest_spot, atm_strike, t_years, RISK_FREE_RATE, "c") + 
                       calculate_iv_safe(pe_close, latest_spot, atm_strike, t_years, RISK_FREE_RATE, "p")) / 2.0
             
-            iv_edge = avg_iv - latest["HV_20"]
+            iv_edge = avg_iv - hv_val
 
-            if iv_edge > 0:
-                results.append({
-                    "Ticker": ticker, "Spot": round(latest_spot, 2), "ATM Strike": atm_strike,
-                    "Max Pain": max_pain_strike, "Pain Dist %": round(pain_distance_pct, 2),
-                    "Days to Earnings": days_to_earnings if days_to_earnings != 999 else "N/A",
-                    "Total Prem": round(ce_close + pe_close, 2), "IV Edge %": round(iv_edge, 2),
-                })
+            # 5. Qualification Logic
+            qualifies = True
+            if adx_val >= 20: qualifies = False
+            if not (40 <= rsi_val <= 60): qualifies = False
+            if days_to_earnings <= 30: qualifies = False
+            if pd.isna(iv_edge) or iv_edge <= 0: qualifies = False
+
+            # 6. Append Row matching your image structure + technicals
+            results.append({
+                "Ticker": ticker, 
+                "Spot": round(latest_spot, 2),
+                "ADX": adx_val,
+                "RSI": rsi_val,
+                "ATM Strike": atm_strike,
+                "Max Pain": max_pain_strike,
+                "Pain Dist %": round(pain_distance_pct, 2),
+                "Days to Earnings": days_to_earnings if days_to_earnings != 999 else "N/A",
+                "Total Prem": round(straddle_prem, 2),
+                "Avg IV %": round(avg_iv, 2),
+                "HV 20D %": round(hv_val, 2),
+                "IV Edge %": round(iv_edge, 2),
+                "Qualifies": "✅ Yes" if qualifies else "❌ No",
+                "_sort_iv_edge": iv_edge  # Used for internal sorting
+            })
+                
         except Exception:
             continue
 
     df_out = pd.DataFrame(results)
     if not df_out.empty:
-        df_out = df_out.sort_values(by="IV Edge %", ascending=False)
+        # Sort so qualifying stocks are at the top, then by highest IV Edge
+        df_out = df_out.sort_values(by=["Qualifies", "_sort_iv_edge"], ascending=[False, False])
+        df_out = df_out.drop(columns=["_sort_iv_edge"])
+        
+        # Format columns with % symbol for email output
+        df_out["Pain Dist %"] = df_out["Pain Dist %"].astype(str) + "%"
+        df_out["Avg IV %"] = df_out["Avg IV %"].astype(str) + "%"
+        df_out["HV 20D %"] = df_out["HV 20D %"].astype(str) + "%"
+        df_out["IV Edge %"] = df_out["IV Edge %"].astype(str) + "%"
+        
     return df_out, target_date
 
 # =====================================================================
-# EMAIL DELIVERY ENGINE (STARTTLS ON PORT 587)
+# EMAIL DELIVERY ENGINE
 # =====================================================================
 def send_email_alert(df_results: pd.DataFrame, target_date: date):
     sender_email = os.environ.get("SENDER_EMAIL", "").strip()
     app_password = os.environ.get("APP_PASSWORD", "").replace(" ", "").strip()
     recipient_email = os.environ.get("RECIPIENT_EMAIL", "").strip()
 
-    if not sender_email or not app_password or not recipient_email:
-        print("ERROR: One or more email secrets are missing. Skipping delivery.")
-        return
-
     msg = MIMEMultipart()
-    msg['Subject'] = f"Straddle Screener Alert - {target_date}"
+    msg['Subject'] = f"Comprehensive Straddle Report - {target_date}"
     msg['From'] = sender_email
     msg['To'] = recipient_email
 
     if not df_results.empty:
         html_table = df_results.to_html(index=False, justify='center', border=1)
-        body = f"<html><body><h2>Short Straddle Candidates ({target_date})</h2>{html_table}</body></html>"
+        body = f"""
+        <html>
+        <head>
+        <style>
+            table {{ border-collapse: collapse; width: 100%; font-family: sans-serif; font-size: 12px; }}
+            th, td {{ padding: 8px; text-align: center; border: 1px solid #ddd; }}
+            th {{ background-color: #f2f2f2; }}
+            td:last-child {{ font-weight: bold; }}
+        </style>
+        </head>
+        <body>
+            <h2>Complete F&O Setup Report ({target_date})</h2>
+            <p>Below is the data for every evaluated F&O stock. <strong>Filter requirements:</strong> ADX < 20, RSI between 40-60, DTE > 30, and Positive IV Edge.</p>
+            {html_table}
+        </body>
+        </html>
+        """
     else:
-        body = f"<html><body><h3>No setups passed the filters for {target_date}.</h3></body></html>"
+        body = f"<html><body><h3>Error: F&O Universe could not be processed for {target_date}.</h3></body></html>"
 
     msg.attach(MIMEText(body, 'html'))
 
-    # Reliable TLS delivery across Azure/GitHub runners
     try:
         print("Connecting via SMTP (Port 587 STARTTLS)...")
         server = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
@@ -266,22 +303,17 @@ def send_email_alert(df_results: pd.DataFrame, target_date: date):
             server.login(sender_email, app_password)
             server.send_message(msg)
             server.quit()
-            print(f"Email successfully delivered via SSL fallback to {recipient_email}")
+            print(f"Email successfully delivered via SSL fallback.")
         except Exception as final_e:
             print(f"CRITICAL: Email delivery failed: {final_e}")
 
-# =====================================================================
-# MAIN ENTRY POINT
-# =====================================================================
 if __name__ == "__main__":
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Screener Pipeline...")
     results, report_date = run_short_straddle_screener(FALLBACK_FO_UNIVERSE)
 
     if not results.empty:
-        print("\n=== SHORT STRADDLE CANDIDATES ===")
-        print(results.to_string(index=False))
-    else:
-        print("\nNo setups passed the filters today.")
-
+        print("\n=== EVALUATION COMPLETE ===")
+        print(f"Total Stocks Processed: {len(results)}")
+        
     send_email_alert(results, report_date)
     print("Execution complete.")
