@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 # =====================================================================
 # CONFIGURATION
 # =====================================================================
-EXPIRY_DATE = date(2026, 10, 29)  
+EXPIRY_DATE = date(2026, 10, 29)  # Update monthly to the next F&O Expiry
 RISK_FREE_RATE = 0.07             
 BHAVCOPY_DIR = "/tmp"             
 
@@ -67,6 +67,7 @@ FALLBACK_FO_UNIVERSE = [
 # DATA EXTRACTION & RESILIENCE
 # =====================================================================
 def get_historical_data(ticker: str) -> pd.DataFrame:
+    """Attempts TvDatafeed first; automatically falls back to Yahoo Finance on timeout."""
     try:
         df = tv.get_hist(symbol=ticker, exchange="NSE", interval=Interval.in_daily, n_bars=250)
         if df is not None and not df.empty and len(df) >= 50:
@@ -86,6 +87,7 @@ def get_historical_data(ticker: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def download_latest_fo_bhavcopy() -> tuple[pd.DataFrame, date]:
+    """Tries today's date, stepping back up to 5 days for weekends/holidays. Handles NSE Format changes."""
     check_date = date.today()
     for _ in range(5):
         try:
@@ -94,11 +96,14 @@ def download_latest_fo_bhavcopy() -> tuple[pd.DataFrame, date]:
             bhavcopy = pd.read_csv(file_path)
             bhavcopy.columns = bhavcopy.columns.str.strip()
             
+            # Check if UDiFF format and map if necessary (preserves legacy mapping if not present)
             udiff_map = {
                 "FinInstrmTp": "INSTRUMENT", "TckrSymb": "SYMBOL", "XpryDt": "EXPIRY_DT",
                 "StrkPric": "STRIKE_PR", "OptnTp": "OPTION_TYP", "ClsPric": "CLOSE", "OpnIntrst": "OPEN_INT"
             }
-            bhavcopy.rename(columns=udiff_map, inplace=True)
+            if "TckrSymb" in bhavcopy.columns:
+                bhavcopy.rename(columns=udiff_map, inplace=True)
+            
             bhavcopy = bhavcopy[bhavcopy["INSTRUMENT"].isin(["OPTSTK", "STO"])].copy()
             bhavcopy["EXPIRY_DT"] = pd.to_datetime(bhavcopy["EXPIRY_DT"]).dt.date
             bhavcopy["STRIKE_PR"] = pd.to_numeric(bhavcopy["STRIKE_PR"], errors='coerce')
@@ -107,8 +112,10 @@ def download_latest_fo_bhavcopy() -> tuple[pd.DataFrame, date]:
             
             print(f"Loaded valid F&O Bhavcopy for {check_date}")
             return bhavcopy, check_date
-        except Exception:
+        except Exception as e:
+            print(f"Bhavcopy parsing failed for {check_date}: {e}")
             check_date -= timedelta(days=1)
+            
     raise RuntimeError("Could not retrieve a valid F&O Bhavcopy within the last 5 days.")
 
 def get_historical_volatility(close_prices: pd.Series, window: int = 20) -> pd.Series:
@@ -214,12 +221,10 @@ def run_short_straddle_screener(tickers: list[str]) -> tuple[pd.DataFrame, date]
             if days_to_earnings <= 30: qualifies = False
             if pd.isna(iv_edge) or iv_edge <= 0: qualifies = False
 
-            # 6. Append Row matching your image structure + technicals
+            # 6. Append Row
             results.append({
                 "Ticker": ticker, 
                 "Spot": round(latest_spot, 2),
-                "ADX": adx_val,
-                "RSI": rsi_val,
                 "ATM Strike": atm_strike,
                 "Max Pain": max_pain_strike,
                 "Pain Dist %": round(pain_distance_pct, 2),
@@ -228,8 +233,11 @@ def run_short_straddle_screener(tickers: list[str]) -> tuple[pd.DataFrame, date]
                 "Avg IV %": round(avg_iv, 2),
                 "HV 20D %": round(hv_val, 2),
                 "IV Edge %": round(iv_edge, 2),
+                "ADX": adx_val,
+                "RSI": rsi_val,
                 "Qualifies": "✅ Yes" if qualifies else "❌ No",
-                "_sort_iv_edge": iv_edge  # Used for internal sorting
+                "_sort_bool": qualifies,  # Invisible sorting helper
+                "_sort_iv_edge": iv_edge  # Invisible sorting helper
             })
                 
         except Exception:
@@ -237,9 +245,9 @@ def run_short_straddle_screener(tickers: list[str]) -> tuple[pd.DataFrame, date]
 
     df_out = pd.DataFrame(results)
     if not df_out.empty:
-        # Sort so qualifying stocks are at the top, then by highest IV Edge
-        df_out = df_out.sort_values(by=["Qualifies", "_sort_iv_edge"], ascending=[False, False])
-        df_out = df_out.drop(columns=["_sort_iv_edge"])
+        # Sort so qualifying stocks are exactly at the top, then by highest IV Edge
+        df_out = df_out.sort_values(by=["_sort_bool", "_sort_iv_edge"], ascending=[False, False])
+        df_out = df_out.drop(columns=["_sort_bool", "_sort_iv_edge"])
         
         # Format columns with % symbol for email output
         df_out["Pain Dist %"] = df_out["Pain Dist %"].astype(str) + "%"
@@ -282,7 +290,7 @@ def send_email_alert(df_results: pd.DataFrame, target_date: date):
         </html>
         """
     else:
-        body = f"<html><body><h3>Error: F&O Universe could not be processed for {target_date}.</h3></body></html>"
+        body = f"<html><body><h3>Error: F&O Universe could not be processed for {target_date}. No options data found.</h3></body></html>"
 
     msg.attach(MIMEText(body, 'html'))
 
