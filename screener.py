@@ -20,7 +20,6 @@ warnings.filterwarnings("ignore")
 # =====================================================================
 # CONFIGURATION
 # =====================================================================
-EXPIRY_DATE = date(2026, 10, 29)  # Update monthly to the next F&O Expiry
 RISK_FREE_RATE = 0.07             
 BHAVCOPY_DIR = "/tmp"             
 
@@ -67,7 +66,6 @@ FALLBACK_FO_UNIVERSE = [
 # DATA EXTRACTION & RESILIENCE
 # =====================================================================
 def get_historical_data(ticker: str) -> pd.DataFrame:
-    """Attempts TvDatafeed first; automatically falls back to Yahoo Finance on timeout."""
     try:
         df = tv.get_hist(symbol=ticker, exchange="NSE", interval=Interval.in_daily, n_bars=250)
         if df is not None and not df.empty and len(df) >= 50:
@@ -86,8 +84,8 @@ def get_historical_data(ticker: str) -> pd.DataFrame:
         pass
     return pd.DataFrame()
 
-def download_latest_fo_bhavcopy() -> tuple[pd.DataFrame, date]:
-    """Tries today's date, stepping back up to 5 days for weekends/holidays. Handles NSE Format changes."""
+def download_latest_fo_bhavcopy() -> tuple[pd.DataFrame, date, date]:
+    """Downloads Bhavcopy, sanitizes corrupted strings, and auto-detects Expiry Date."""
     check_date = date.today()
     for _ in range(5):
         try:
@@ -96,7 +94,7 @@ def download_latest_fo_bhavcopy() -> tuple[pd.DataFrame, date]:
             bhavcopy = pd.read_csv(file_path)
             bhavcopy.columns = bhavcopy.columns.str.strip()
             
-            # Check if UDiFF format and map if necessary (preserves legacy mapping if not present)
+            # Unify Legacy & UDiFF
             udiff_map = {
                 "FinInstrmTp": "INSTRUMENT", "TckrSymb": "SYMBOL", "XpryDt": "EXPIRY_DT",
                 "StrkPric": "STRIKE_PR", "OptnTp": "OPTION_TYP", "ClsPric": "CLOSE", "OpnIntrst": "OPEN_INT"
@@ -104,16 +102,29 @@ def download_latest_fo_bhavcopy() -> tuple[pd.DataFrame, date]:
             if "TckrSymb" in bhavcopy.columns:
                 bhavcopy.rename(columns=udiff_map, inplace=True)
             
-            bhavcopy = bhavcopy[bhavcopy["INSTRUMENT"].isin(["OPTSTK", "STO"])].copy()
-            bhavcopy["EXPIRY_DT"] = pd.to_datetime(bhavcopy["EXPIRY_DT"]).dt.date
+            # STRIP ALL INVISIBLE SPACES FROM NSE DATA
+            for col in ["INSTRUMENT", "SYMBOL", "OPTION_TYP"]:
+                if col in bhavcopy.columns:
+                    bhavcopy[col] = bhavcopy[col].astype(str).str.strip()
+            
+            bhavcopy["EXPIRY_DT"] = pd.to_datetime(bhavcopy["EXPIRY_DT"], errors='coerce').dt.date
             bhavcopy["STRIKE_PR"] = pd.to_numeric(bhavcopy["STRIKE_PR"], errors='coerce')
             bhavcopy["CLOSE"] = pd.to_numeric(bhavcopy["CLOSE"], errors='coerce')
             bhavcopy["OPEN_INT"] = pd.to_numeric(bhavcopy["OPEN_INT"], errors='coerce').fillna(0)
             
-            print(f"Loaded valid F&O Bhavcopy for {check_date}")
-            return bhavcopy, check_date
+            # AUTO-DETECT CURRENT MONTH EXPIRY
+            opt_df = bhavcopy[bhavcopy["INSTRUMENT"].isin(["OPTSTK", "STO"])]
+            if opt_df.empty:
+                raise ValueError("No options data in this CSV.")
+            
+            expiries = sorted(opt_df["EXPIRY_DT"].dropna().unique())
+            valid_expiries = [exp for exp in expiries if exp >= check_date]
+            current_expiry = valid_expiries[0] if valid_expiries else expiries[-1]
+            
+            print(f"Loaded Bhavcopy for {check_date}. Auto-detected Expiry: {current_expiry}")
+            return bhavcopy, check_date, current_expiry
         except Exception as e:
-            print(f"Bhavcopy parsing failed for {check_date}: {e}")
+            print(f"Bhavcopy parse failed for {check_date}: {e}")
             check_date -= timedelta(days=1)
             
     raise RuntimeError("Could not retrieve a valid F&O Bhavcopy within the last 5 days.")
@@ -158,20 +169,39 @@ def calculate_iv_safe(price, spot, strike, t_years, r, flag):
         return np.nan
 
 # =====================================================================
-# SCREENER LOGIC (FULL TABULATION)
+# SCREENER LOGIC (NO SILENT FAILURES)
 # =====================================================================
 def run_short_straddle_screener(tickers: list[str]) -> tuple[pd.DataFrame, date]:
-    bhavcopy, target_date = download_latest_fo_bhavcopy()
-    t_years = max((EXPIRY_DATE - target_date).days / 365.0, 0.001)
+    bhavcopy, target_date, current_expiry = download_latest_fo_bhavcopy()
+    t_years = max((current_expiry - target_date).days / 365.0, 0.001)
     results = []
 
-    print(f"Scanning and tabulating {len(tickers)} stocks...")
+    print(f"Scanning {len(tickers)} stocks...")
 
     for ticker in tickers:
         try:
-            # 1. Price Data & Technicals
+            # 1. Option Validation
+            ticker_opts = bhavcopy[(bhavcopy["SYMBOL"] == ticker) & (bhavcopy["INSTRUMENT"].isin(["OPTSTK", "STO"])) & (bhavcopy["EXPIRY_DT"] == current_expiry)].copy()
+            if ticker_opts.empty:
+                results.append({
+                    "Ticker": ticker, "Spot": "N/A", "ATM Strike": "N/A", "Max Pain": "N/A", 
+                    "Pain Dist %": "N/A", "Days to Earnings": "N/A", "Total Prem": "N/A", 
+                    "Avg IV %": "N/A", "HV 20D %": "N/A", "IV Edge %": "N/A",
+                    "ADX": "N/A", "RSI": "N/A", "Qualifies": "❌ No (Missing Options)",
+                    "_sort_bool": False, "_sort_iv_edge": -999
+                })
+                continue
+
+            # 2. Techs Validation
             df = get_historical_data(ticker)
             if df.empty or len(df) < 50:
+                results.append({
+                    "Ticker": ticker, "Spot": "N/A", "ATM Strike": "N/A", "Max Pain": "N/A", 
+                    "Pain Dist %": "N/A", "Days to Earnings": "N/A", "Total Prem": "N/A", 
+                    "Avg IV %": "N/A", "HV 20D %": "N/A", "IV Edge %": "N/A",
+                    "ADX": "N/A", "RSI": "N/A", "Qualifies": "❌ No (API Blocked)",
+                    "_sort_bool": False, "_sort_iv_edge": -998
+                })
                 continue
 
             latest_spot = df["Close"].iloc[-1]
@@ -185,18 +215,13 @@ def run_short_straddle_screener(tickers: list[str]) -> tuple[pd.DataFrame, date]
             rsi_val = round(latest["RSI"], 1)
             hv_val = latest["HV_20"]
             
-            # 2. Earnings
+            # 3. Earnings
             days_to_earnings = get_days_to_earnings(ticker)
 
-            # 3. Options Data & Max Pain
-            ticker_opts = bhavcopy[(bhavcopy["SYMBOL"] == ticker) & (bhavcopy["EXPIRY_DT"] == EXPIRY_DATE)].copy()
-            if ticker_opts.empty:
-                continue
-
+            # 4. Max Pain & ATMs
             max_pain_strike = calculate_max_pain(ticker_opts)
             pain_distance_pct = (abs(latest_spot - max_pain_strike) / latest_spot) * 100
 
-            # 4. Calculate ATM Options
             ticker_opts["Strike_Diff"] = abs(ticker_opts["STRIKE_PR"] - latest_spot)
             atm_strike = ticker_opts.loc[ticker_opts["Strike_Diff"].idxmin()]["STRIKE_PR"]
 
@@ -204,6 +229,13 @@ def run_short_straddle_screener(tickers: list[str]) -> tuple[pd.DataFrame, date]
             atm_pe = ticker_opts[(ticker_opts["STRIKE_PR"] == atm_strike) & (ticker_opts["OPTION_TYP"] == "PE")]
             
             if atm_ce.empty or atm_pe.empty:
+                results.append({
+                    "Ticker": ticker, "Spot": "N/A", "ATM Strike": "N/A", "Max Pain": "N/A", 
+                    "Pain Dist %": "N/A", "Days to Earnings": "N/A", "Total Prem": "N/A", 
+                    "Avg IV %": "N/A", "HV 20D %": "N/A", "IV Edge %": "N/A",
+                    "ADX": "N/A", "RSI": "N/A", "Qualifies": "❌ No (Missing CE/PE)",
+                    "_sort_bool": False, "_sort_iv_edge": -997
+                })
                 continue
 
             ce_close, pe_close = atm_ce.iloc[0]["CLOSE"], atm_pe.iloc[0]["CLOSE"]
@@ -236,8 +268,8 @@ def run_short_straddle_screener(tickers: list[str]) -> tuple[pd.DataFrame, date]
                 "ADX": adx_val,
                 "RSI": rsi_val,
                 "Qualifies": "✅ Yes" if qualifies else "❌ No",
-                "_sort_bool": qualifies,  # Invisible sorting helper
-                "_sort_iv_edge": iv_edge  # Invisible sorting helper
+                "_sort_bool": qualifies, 
+                "_sort_iv_edge": iv_edge if not pd.isna(iv_edge) else -999
             })
                 
         except Exception:
@@ -245,15 +277,17 @@ def run_short_straddle_screener(tickers: list[str]) -> tuple[pd.DataFrame, date]
 
     df_out = pd.DataFrame(results)
     if not df_out.empty:
-        # Sort so qualifying stocks are exactly at the top, then by highest IV Edge
         df_out = df_out.sort_values(by=["_sort_bool", "_sort_iv_edge"], ascending=[False, False])
         df_out = df_out.drop(columns=["_sort_bool", "_sort_iv_edge"])
         
-        # Format columns with % symbol for email output
-        df_out["Pain Dist %"] = df_out["Pain Dist %"].astype(str) + "%"
-        df_out["Avg IV %"] = df_out["Avg IV %"].astype(str) + "%"
-        df_out["HV 20D %"] = df_out["HV 20D %"].astype(str) + "%"
-        df_out["IV Edge %"] = df_out["IV Edge %"].astype(str) + "%"
+        # Safely format percentages
+        def safe_pct(val):
+            return str(val) + "%" if str(val) != "N/A" else "N/A"
+
+        df_out["Pain Dist %"] = df_out["Pain Dist %"].apply(safe_pct)
+        df_out["Avg IV %"] = df_out["Avg IV %"].apply(safe_pct)
+        df_out["HV 20D %"] = df_out["HV 20D %"].apply(safe_pct)
+        df_out["IV Edge %"] = df_out["IV Edge %"].apply(safe_pct)
         
     return df_out, target_date
 
@@ -290,7 +324,7 @@ def send_email_alert(df_results: pd.DataFrame, target_date: date):
         </html>
         """
     else:
-        body = f"<html><body><h3>Error: F&O Universe could not be processed for {target_date}. No options data found.</h3></body></html>"
+        body = f"<html><body><h3>Critical Pipeline Failure: No data parsed for {target_date}.</h3></body></html>"
 
     msg.attach(MIMEText(body, 'html'))
 
